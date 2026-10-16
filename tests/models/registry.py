@@ -861,6 +861,12 @@ _MULTIMODAL_EXAMPLE_MODELS = {
     "DeepseekV41ForCausalLM": _HfExamplesInfo(
         "deepseek-ai/DeepSeek-V4.1-Flash",
     ),
+    "DifficultyLevelsClefForJointSchema": _HfExamplesInfo(
+        "Qwen/Qwen3.5-4B",
+        max_model_len=4096,
+        # A HUB checkpoint exported locally; it is not on the Hugging Face Hub.
+        is_available_online=False,
+    ),
     "Dots3NoteForCausalLM": _HfExamplesInfo(
         "dots-studio/dots3-note-prev",
         is_available_online=False,

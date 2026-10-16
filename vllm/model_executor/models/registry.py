@@ -289,6 +289,10 @@ _TOKEN_CLASSIFICATION_MODELS = {
     "BertForTokenClassification": ("bert", "BertForTokenClassification"),
     "ClefFlashForJointSchema": ("clef_flash", "ClefFlashForJointSchema"),
     "ClefOmniForJointSchema": ("clef_omni", "ClefOmniForJointSchema"),
+    "DifficultyLevelsClefForJointSchema": (
+        "customs.difficulty_levels_clef",
+        "DifficultyLevelsClefForJointSchema",
+    ),
     "ModernBertForTokenClassification": (
         "modernbert",
         "ModernBertForTokenClassification",

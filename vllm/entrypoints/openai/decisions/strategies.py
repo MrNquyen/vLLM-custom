@@ -903,6 +903,146 @@ class ClefFlashStrategy(JointSchemaStrategy):
         return engine_input
 
 
+class DifficultyLevelsClefStrategy(JointSchemaStrategy):
+    """HUB's Clef difficulty levels model, ``DifficultyLevelsClefForJointSchema``.
+
+    Builds the prompt like ``encode_record`` in HUB's
+    ``src/models/decision_model/clef.py``; keep the two in sync when HUB's
+    prompt changes. HUB trains on images only, read with the checkpoint's
+    processor settings.
+    """
+
+    modalities = frozenset({"image"})
+    #: ``encode_record``'s default ``max_length``.
+    MAX_LENGTH = 16384
+    SYSTEM_PROMPT = (
+        "Read the complete state and schema. Decide every field jointly. Each "
+        "answer must be exactly one of that field's allowed options."
+    )
+    IMAGE_PLACEHOLDER = "<|vision_start|><|image_pad|><|vision_end|>"
+    NOUL_CRITERIA = {
+        "true": "The proposition is true or the answer is yes.",
+        "false": "The proposition is false or the answer is no.",
+    }
+
+    def __init__(self, context: ReadContext):
+        super().__init__(context)
+        self.prefix = self._tokens(
+            f"<|im_start|>system\n{self.SYSTEM_PROMPT}<|im_end|>\n"
+            "<|im_start|>user\nSTATE:\n"
+        )
+        self.suffix = self._tokens(
+            "\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+            "JOINT SCHEMA DECISIONS:"
+        )
+
+    async def _render_media(
+        self, media: Mapping[str, Sequence[str]], cache_salt: str | None
+    ) -> MultiModalInput:
+        """HUB's ``_encode_media``: the prefix, then every image's placeholder
+        and a single newline, with the placeholders expanded."""
+        try:
+            images = await asyncio.gather(
+                *map(self._connector.fetch_image_async, media.get("image", ()))
+            )
+        except ValueError as e:
+            raise StructuredDecisionError(f"media: {e}") from e
+        prompt = TokensPrompt(
+            prompt_token_ids=self.prefix
+            + self._tokens(self.IMAGE_PLACEHOLDER * len(images) + "\n"),
+            multi_modal_data={"image": list(images)},
+        )
+        if cache_salt is not None:
+            prompt["cache_salt"] = cache_salt
+        try:
+            engine_input = (
+                await self.context.online_renderer.renderer.process_for_engine_async(
+                    prompt, time.time()
+                )
+            )
+        except ValueError as e:
+            raise StructuredDecisionError(f"media: {e}") from e
+        assert engine_input["type"] == "multimodal"
+        return engine_input
+
+    def _options(self, q: Question) -> list[tuple[int, str, Any]]:
+        """HUB's ``question_options``: each option's index in ``q.options``,
+        id and description. Choices are sorted by id, noul is true then false,
+        score levels keep their order."""
+        if q.type.name == "noul":
+            return [
+                (
+                    i,
+                    key,
+                    self.NOUL_CRITERIA[key] if o.description is None else o.description,
+                )
+                for i, (key, o) in enumerate(zip(("true", "false"), q.options))
+            ]
+        if q.type.name == "choice":
+            return sorted(
+                ((i, o.name, o.description) for i, o in enumerate(q.options)),
+                key=lambda option: option[1],
+            )
+        if q.type.name == "score":
+            return [(i, str(i), o.name) for i, o in enumerate(q.options)]
+        raise StructuredDecisionError(
+            f"question {q.id!r}: this model does not answer {q.type.name!r} questions"
+        )
+
+    def encode(
+        self, questions: list[Question], state: str, prefix: list[int] | None = None
+    ) -> tuple[list[int], dict[str, list[Any]], list[list[int]]]:
+        """HUB's ``encode_record``: the prompt, the schema for the pooler, and
+        each question's option indices in the order of the output. ``prefix``
+        is the system prompt, followed by the images if there are any."""
+        prefix = self.prefix if prefix is None else prefix
+
+        # Schema fields; spans count from the start of the schema for now.
+        schema_ids = self._tokens("\n\nSCHEMA FIELDS:\n")
+        question_spans, option_spans, orders = [], [], []
+        for n, q in enumerate(questions, start=1):
+            schema_ids += self._tokens(
+                f"\nFIELD {n}\nID: {q.id}\nTYPE: {q.type.name}\nINSTRUCTION: "
+            )
+            start = len(schema_ids)
+            schema_ids += self._tokens(q.instructions or q.id)
+            question_spans.append((start, len(schema_ids)))
+            schema_ids += self._tokens("\nALLOWED OPTIONS:\n")
+            options = self._options(q)
+            for m, (_, option_id, description) in enumerate(options, start=1):
+                schema_ids += self._tokens(f"OPTION {m}: ")
+                start = len(schema_ids)
+                semantics = {"option_id": option_id}
+                if description is not None:
+                    semantics["description"] = description
+                schema_ids += self._tokens(self._render(semantics))
+                option_spans.append((start, len(schema_ids)))
+                schema_ids += self._tokens("\n")
+            schema_ids += self._tokens("END FIELD\n")
+            orders.append([i for i, _, _ in options])
+
+        # The state is cut to what the prefix, schema and suffix leave.
+        fixed = len(prefix) + len(schema_ids) + len(self.suffix)
+        if fixed > self.max_length:
+            raise StructuredDecisionError(
+                f"the questions take {fixed} tokens, more than the "
+                f"{self.max_length} this model reads"
+            )
+        state_ids = self._tokens(state)[: self.max_length - fixed]
+        prompt = prefix + state_ids + schema_ids + self.suffix
+
+        # Spans count from the end of the prompt, so they hold once the image
+        # placeholders in the prefix expand.
+        end = len(schema_ids) + len(self.suffix)
+        schema: dict[str, list[Any]] = {
+            "question_types": [self.TYPE_IDS[q.type.name] for q in questions],
+            "question_spans": [[s - end, e - end] for s, e in question_spans],
+            "option_spans": [[s - end, e - end] for s, e in option_spans],
+            "option_counts": [len(order) for order in orders],
+        }
+        return prompt, schema, orders
+
+
 class D3Strategy(ReadStrategy):
     """Decision 3.0 code-readout models. Each question is one classify read of
     the prompt the checkpoint's `d3_format.py` writes: the state, the question
@@ -1161,6 +1301,7 @@ READ_STRATEGIES: dict[str, type[ReadStrategy]] = {
     "ClefFlashForJointSchema": ClefFlashStrategy,
     "ClefOmniForJointSchema": JointSchemaStrategy,
     "D3ForSequenceClassification": D3Strategy,
+    "DifficultyLevelsClefForJointSchema": DifficultyLevelsClefStrategy,
     "Lfm2VlForConditionalGeneration": LiquidStrategy,
     "Qwen3ForCausalLM": NextTokenStrategy,
     "Qwen3_5ForConditionalGeneration": NextTokenStrategy,
