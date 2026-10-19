@@ -293,6 +293,10 @@ _TOKEN_CLASSIFICATION_MODELS = {
         "customs.difficulty_levels_clef",
         "DifficultyLevelsClefForJointSchema",
     ),
+    "DifficultyLevelsClefOptimizeCacheForJointSchema": (
+        "customs.difficulty_levels_clef",
+        "DifficultyLevelsClefForJointSchema",
+    ),
     "ModernBertForTokenClassification": (
         "modernbert",
         "ModernBertForTokenClassification",

@@ -780,6 +780,25 @@ class JointSchemaStrategy(ReadStrategy):
         }
         return prompt, schema, orders
 
+    async def _encode_input(
+        self,
+        questions: list[Question],
+        state: str,
+        media: Mapping[str, Sequence[str]] | None,
+        cache_salt: str | None,
+    ) -> tuple[EngineInput, dict[str, list[Any]], list[list[int]]]:
+        engine_input: EngineInput
+        if media:
+            engine_input = await self._render_media(media, cache_salt)
+            prompt, schema, orders = self.encode(
+                questions, state, engine_input["prompt_token_ids"]
+            )
+            engine_input["prompt_token_ids"] = prompt
+        else:
+            prompt, schema, orders = self.encode(questions, state)
+            engine_input = tokens_input(prompt, cache_salt=cache_salt)
+        return engine_input, schema, orders
+
     async def read(
         self,
         questions: list[Question],
@@ -798,16 +817,10 @@ class JointSchemaStrategy(ReadStrategy):
             raise StructuredDecisionError(
                 "this model reads a fixed prompt, so it takes no instructions"
             )
-        engine_input: EngineInput
-        if media:
-            engine_input = await self._render_media(media, cache_salt)
-            prompt, schema, orders = self.encode(
-                questions, state, engine_input["prompt_token_ids"]
-            )
-            engine_input["prompt_token_ids"] = prompt
-        else:
-            prompt, schema, orders = self.encode(questions, state)
-            engine_input = tokens_input(prompt, cache_salt=cache_salt)
+        engine_input, schema, orders = await self._encode_input(
+            questions, state, media, cache_salt
+        )
+        prompt = engine_input["prompt_token_ids"]
         result = None
         async for result in self.context.engine_client.encode(
             engine_input,
@@ -937,7 +950,11 @@ class DifficultyLevelsClefStrategy(JointSchemaStrategy):
         )
 
     async def _render_media(
-        self, media: Mapping[str, Sequence[str]], cache_salt: str | None
+        self,
+        media: Mapping[str, Sequence[str]],
+        cache_salt: str | None,
+        *,
+        prefix: list[int] | None = None,
     ) -> MultiModalInput:
         """HUB's ``_encode_media``: the prefix, then every image's placeholder
         and a single newline, with the placeholders expanded."""
@@ -948,7 +965,7 @@ class DifficultyLevelsClefStrategy(JointSchemaStrategy):
         except ValueError as e:
             raise StructuredDecisionError(f"media: {e}") from e
         prompt = TokensPrompt(
-            prompt_token_ids=self.prefix
+            prompt_token_ids=(self.prefix if prefix is None else prefix)
             + self._tokens(self.IMAGE_PLACEHOLDER * len(images) + "\n"),
             multi_modal_data={"image": list(images)},
         )
@@ -1041,6 +1058,98 @@ class DifficultyLevelsClefStrategy(JointSchemaStrategy):
             "option_counts": [len(order) for order in orders],
         }
         return prompt, schema, orders
+
+
+class DifficultyLevelsClefOptimizeCacheStrategy(DifficultyLevelsClefStrategy):
+    """HUB's ``encode_record_optimize_cache`` with a shared schema prefix.
+
+    Readout spans follow the state and images so their causal hidden states
+    include the evidence. The backbone and decision head are unchanged.
+    """
+
+    def __init__(self, context: ReadContext):
+        super().__init__(context)
+        self.prefix = self._tokens(
+            f"<|im_start|>system\n{self.SYSTEM_PROMPT}<|im_end|>\n"
+            "<|im_start|>user\nSCHEMA FIELDS:\n"
+        )
+
+    def _schema_parts(
+        self, questions: list[Question]
+    ) -> tuple[list[int], list[int], dict[str, list[Any]], list[list[int]]]:
+        prefix = self.prefix.copy()
+        readout = self._tokens("\n\nDECISION FIELDS:\n")
+        newline = self._tokens("\n")
+        end_field = self._tokens("END FIELD\n")
+        question_spans, option_spans, orders = [], [], []
+        for n, q in enumerate(questions, start=1):
+            prefix += self._tokens(
+                f"\nFIELD {n}\nID: {q.id}\nTYPE: {q.type.name}\nINSTRUCTION: "
+            )
+            prefix += self._tokens(q.instructions or q.id)
+            prefix += self._tokens("\nALLOWED OPTIONS:\n")
+            readout += self._tokens(f"\nFIELD {n}\nID: ")
+            start = len(readout)
+            readout += self._tokens(q.id)
+            question_spans.append((start, len(readout)))
+            readout += self._tokens("\nOPTIONS:\n")
+            options = self._options(q)
+            for m, (_, option_id, description) in enumerate(options, start=1):
+                label = self._tokens(f"OPTION {m}: ")
+                semantics = {"option_id": option_id}
+                if description is not None:
+                    semantics["description"] = description
+                semantics_ids = self._tokens(self._render(semantics))
+                prefix += label + semantics_ids + newline
+                readout += label
+                start = len(readout)
+                readout += semantics_ids
+                option_spans.append((start, len(readout)))
+                readout += newline
+            prefix += end_field
+            readout += end_field
+            orders.append([i for i, _, _ in options])
+        prefix += self._tokens("\nSTATE:\n")
+        end = len(readout) + len(self.suffix)
+        schema: dict[str, list[Any]] = {
+            "question_types": [self.TYPE_IDS[q.type.name] for q in questions],
+            "question_spans": [[s - end, e - end] for s, e in question_spans],
+            "option_spans": [[s - end, e - end] for s, e in option_spans],
+            "option_counts": [len(order) for order in orders],
+        }
+        return prefix, readout, schema, orders
+
+    def encode(
+        self, questions: list[Question], state: str, prefix: list[int] | None = None
+    ) -> tuple[list[int], dict[str, list[Any]], list[list[int]]]:
+        """Encode with the full schema prefix and optional expanded images."""
+        schema_prefix, readout, schema, orders = self._schema_parts(questions)
+        prefix = schema_prefix if prefix is None else prefix
+        fixed = len(prefix) + len(readout) + len(self.suffix)
+        if fixed > self.max_length:
+            raise StructuredDecisionError(
+                f"the questions and images take {fixed} tokens, more than the "
+                f"{self.max_length} this model reads"
+            )
+        state_ids = self._tokens(state)[: self.max_length - fixed]
+        return prefix + state_ids + readout + self.suffix, schema, orders
+
+    async def _encode_input(
+        self,
+        questions: list[Question],
+        state: str,
+        media: Mapping[str, Sequence[str]] | None,
+        cache_salt: str | None,
+    ) -> tuple[EngineInput, dict[str, list[Any]], list[list[int]]]:
+        if not media:
+            return await super()._encode_input(questions, state, media, cache_salt)
+        prefix, _, _, _ = self._schema_parts(questions)
+        engine_input = await self._render_media(media, cache_salt, prefix=prefix)
+        prompt, schema, orders = self.encode(
+            questions, state, engine_input["prompt_token_ids"]
+        )
+        engine_input["prompt_token_ids"] = prompt
+        return engine_input, schema, orders
 
 
 class D3Strategy(ReadStrategy):
@@ -1302,6 +1411,9 @@ READ_STRATEGIES: dict[str, type[ReadStrategy]] = {
     "ClefOmniForJointSchema": JointSchemaStrategy,
     "D3ForSequenceClassification": D3Strategy,
     "DifficultyLevelsClefForJointSchema": DifficultyLevelsClefStrategy,
+    "DifficultyLevelsClefOptimizeCacheForJointSchema": (
+        DifficultyLevelsClefOptimizeCacheStrategy
+    ),
     "Lfm2VlForConditionalGeneration": LiquidStrategy,
     "Qwen3ForCausalLM": NextTokenStrategy,
     "Qwen3_5ForConditionalGeneration": NextTokenStrategy,
