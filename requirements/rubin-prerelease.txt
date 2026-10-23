@@ -10,5 +10,5 @@ torchvision==0.30.0.dev20261009+cu134
 torchaudio==2.11.0.dev20261009+cu134
 
 cuda-python==13.4.1
-cuda-bindings==13.4.1
+cuda-bindings==13.4.4
 nixl==1.4.1
